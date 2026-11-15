@@ -42,7 +42,6 @@
 #elif defined(__FreeBSD__)
 #include <pthread_np.h>
 #include <sys/procctl.h>
-#include <sys/syscall.h>
 #include <ucontext.h>
 #elif defined(__OpenBSD__)
 #include <pthread_np.h>
@@ -258,10 +257,7 @@ static void frankenphp_fill_cli_signal_set(sigset_t *s) {
 /* Report fatal signals received by threads created by C, such as PHP threads:
  * without a handler the process dies without any output. The handler writes
  * one line to stderr, then lets the process terminate from the signal as it
- * did before.
- *
- * A fault in C code called from a goroutine keeps its goroutine traceback and
- * its exit status, see frankenphp_let_go_report_fault(). */
+ * did before. */
 static const int frankenphp_fatal_signals[] = {SIGSEGV, SIGBUS, SIGFPE, SIGILL,
                                                SIGABRT};
 
@@ -281,14 +277,6 @@ static const char *frankenphp_fatal_signal_name(int sig) {
     return "unknown";
   }
 }
-
-/* The si_code that makes the Go handler report a signal itself; the value is
- * pinned per OS by TestGoTracebackIsKeptWhenGoThreadSegfaultsInC. */
-#if defined(__APPLE__)
-#define FRANKENPHP_SI_CODE_SENT_BY_PROCESS 0
-#else
-#define FRANKENPHP_SI_CODE_SENT_BY_PROCESS SI_USER
-#endif
 
 static bool frankenphp_is_cpu_fault(const siginfo_t *info) {
 #if defined(__FreeBSD__)
@@ -415,65 +403,30 @@ static void frankenphp_write_crash_report(int sig, siginfo_t *info,
 static atomic_flag frankenphp_crash_reported = ATOMIC_FLAG_INIT;
 
 static void frankenphp_fatal_signal_handler(int sig, siginfo_t *info,
-                                            void *context);
-
-/* Returns the action installed by the Go runtime, not the handler of this
- * file. */
-static int frankenphp_kernel_sigaction(int sig, struct sigaction *action) {
-#if defined(__FreeBSD__)
-  return syscall(SYS_sigaction, sig, NULL, action);
-#else
-  return sigaction(sig, NULL, action);
-#endif
-}
-
-/* The handler also receives the faults of C code called from a goroutine.
- * Terminating right away would drop the goroutine traceback, which tells
- * which Go code called into C, so the Go handler gets the first chance to
- * report.
- *
- * It is given a copy of the fault marked as sent by the process: given the
- * fault as is, it would call this handler again. The context is the original
- * one, so the traceback still points to the faulting instruction.
- *
- * If Go has a traceback to print, it prints it and exits. Otherwise the
- * signal comes back to frankenphp_fatal_signal_handler(), which terminates
- * the process. */
-static void frankenphp_let_go_report_fault(int sig, const siginfo_t *info,
-                                           void *context) {
-  struct sigaction go_action;
-  if (frankenphp_kernel_sigaction(sig, &go_action) != 0 ||
-      !(go_action.sa_flags & SA_SIGINFO) ||
-      go_action.sa_sigaction == frankenphp_fatal_signal_handler) {
-    return;
-  }
-
-  siginfo_t sent_by_process = *info;
-  sent_by_process.si_code = FRANKENPHP_SI_CODE_SENT_BY_PROCESS;
-  go_action.sa_sigaction(sig, &sent_by_process, context);
-}
-
-static void frankenphp_fatal_signal_handler(int sig, siginfo_t *info,
                                             void *context) {
-  bool first_report = !atomic_flag_test_and_set(&frankenphp_crash_reported);
-  if (first_report) {
+  if (!atomic_flag_test_and_set(&frankenphp_crash_reported)) {
     frankenphp_write_crash_report(sig, info, context);
-
-    if (frankenphp_is_cpu_fault(info)) {
-      frankenphp_let_go_report_fault(sig, info, context);
-    }
   }
 
   /* Terminate from the signal itself, so that the exit status and the core
    * dump stay what a supervisor expects. */
   signal(sig, SIG_DFL);
-  /* A CPU fault happens again when the handler returns; any other signal has
-   * to be raised again. */
-  if (!frankenphp_is_cpu_fault(info)) {
-    raise(sig);
+  if (frankenphp_is_cpu_fault(info)) {
+    /* the faulting instruction runs again */
+    return;
   }
+
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, sig);
+  pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+  raise(sig);
+
+  /* https://github.com/php/frankenphp/issues/2558 */
+  _exit(128 + sig);
 }
 
+/* https://pkg.go.dev/os/signal#hdr-Non_Go_programs_that_call_Go_code */
 static void frankenphp_install_fatal_signal_handler(void) {
   size_t count =
       sizeof(frankenphp_fatal_signals) / sizeof(frankenphp_fatal_signals[0]);
@@ -491,8 +444,6 @@ static void frankenphp_install_fatal_signal_handler(void) {
     memset(&action, 0, sizeof(action));
     action.sa_sigaction = frankenphp_fatal_signal_handler;
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    /* The Go handler is called from this one: block every signal, as Go
-     * does for its own handler. */
     sigfillset(&action.sa_mask);
     sigaction(sig, &action, NULL);
   }

@@ -4,4 +4,6 @@ package main
 
 func crashInCThread() {}
 
+func abortInCThread() {}
+
 func crashInGoThread() {}

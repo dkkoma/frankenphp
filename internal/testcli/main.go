@@ -17,6 +17,9 @@ func main() {
 	case "--crash-in-c-thread":
 		crashInCThread()
 		os.Exit(0)
+	case "--abort-in-c-thread":
+		abortInCThread()
+		os.Exit(0)
 	case "--crash-in-go-thread":
 		crashInGoThread()
 		os.Exit(0)
