@@ -185,7 +185,18 @@ typedef struct frankenphp_config {
 frankenphp_config frankenphp_get_config();
 
 int frankenphp_new_main_thread(int num_threads);
+void frankenphp_startup_php(int num_threads);
+void frankenphp_shutdown_php(void);
+
 bool frankenphp_new_php_thread(uintptr_t thread_index);
+void frankenphp_init_php_thread(void);
+void frankenphp_free_php_thread(void);
+
+typedef struct {
+  bool thread_is_healthy;
+  int exit_status;
+} frankenphp_script_result;
+frankenphp_script_result frankenphp_execute_script(char *script_name);
 
 bool frankenphp_shutdown_dummy_request(void);
 void frankenphp_update_local_thread_context(bool is_worker);

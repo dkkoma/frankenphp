@@ -260,8 +260,21 @@ func inactivePHPThread() (*phpThread, error) {
 	return nil, ErrMaxThreadsReached
 }
 
-//export go_frankenphp_main_thread_is_ready
-func go_frankenphp_main_thread_is_ready() {
+//export go_frankenphp_run_main_thread
+func go_frankenphp_run_main_thread(numThreads C.int) {
+	C.frankenphp_startup_php(numThreads)
+	mainThread.serve()
+	// drainPHPThreads has already waited for every PHP thread to exit
+	// (state.Done), so SAPI/TSRM teardown here is safe.
+	C.frankenphp_shutdown_php()
+
+	if mainThread.state.CompareAndSwap(state.Rebooting, state.YieldingForReboot) {
+		return
+	}
+	mainThread.state.Set(state.Reserved)
+}
+
+func (mainThread *phpMainThread) serve() {
 	mainThread.setAutomaticMaxThreads()
 	if mainThread.maxThreads < mainThread.numThreads {
 		mainThread.maxThreads = mainThread.numThreads
@@ -290,14 +303,6 @@ func (mainThread *phpMainThread) setAutomaticMaxThreads() {
 	if globalLogger.Enabled(globalCtx, slog.LevelDebug) {
 		globalLogger.LogAttrs(globalCtx, slog.LevelDebug, "Automatic thread limit", slog.Int("perThreadMemoryLimitMB", int(perThreadMemoryLimit/1024/1024)), slog.Int("maxThreads", mainThread.maxThreads))
 	}
-}
-
-//export go_frankenphp_shutdown_main_thread
-func go_frankenphp_shutdown_main_thread() {
-	if mainThread.state.CompareAndSwap(state.Rebooting, state.YieldingForReboot) {
-		return
-	}
-	mainThread.state.Set(state.Reserved)
 }
 
 //export go_is_hot_reload_enabled

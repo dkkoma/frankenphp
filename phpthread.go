@@ -346,27 +346,60 @@ func (*phpThread) updateContext(isWorker bool) {
 	C.frankenphp_update_local_thread_context(C.bool(isWorker))
 }
 
-//export go_frankenphp_before_script_execution
-func go_frankenphp_before_script_execution(threadIndex C.uintptr_t) *C.char {
+//export go_frankenphp_run_php_thread
+func go_frankenphp_run_php_thread(threadIndex C.uintptr_t) {
 	thread := phpThreads[threadIndex]
-	scriptName := thread.handler.beforeScriptExecution()
 
-	// if no scriptName is passed, shut down
-	if scriptName == "" {
-		return nil
+	C.frankenphp_init_php_thread()
+	healthy := thread.executeScripts()
+	thread.clearForceKillSlot()
+	C.frankenphp_free_php_thread()
+
+	if !healthy {
+		thread.restartUnhealthy()
+
+		return
 	}
 
-	// return the name of the PHP script that should be executed
-	return thread.pinCString(scriptName)
+	thread.Unpin()
+
+	switch thread.state.Get() {
+	case state.Rebooting:
+		thread.state.Set(state.RebootReady)
+	case state.ForceRebooting:
+		thread.state.Set(state.YieldingForReboot)
+	default:
+		thread.state.Set(state.Done)
+	}
 }
 
-//export go_frankenphp_after_script_execution
-func go_frankenphp_after_script_execution(threadIndex C.uintptr_t, exitStatus C.int) {
-	thread := phpThreads[threadIndex]
-	thread.handler.afterScriptExecution(int(exitStatus))
+func (thread *phpThread) executeScripts() (healthy bool) {
+	for {
+		scriptName := thread.handler.beforeScriptExecution()
+		if scriptName == "" {
+			return true
+		}
 
-	// unpin all memory used during script execution
-	thread.Unpin()
+		result := C.frankenphp_execute_script(thread.pinCString(scriptName))
+		thread.handler.afterScriptExecution(int(result.exit_status))
+
+		// unpin all memory used during script execution
+		thread.Unpin()
+
+		if !result.thread_is_healthy {
+			return false
+		}
+	}
+}
+
+func (thread *phpThread) restartUnhealthy() {
+	logger, ctx := getLogger(C.uintptr_t(thread.threadIndex))
+	logger.LogAttrs(ctx, slog.LevelWarn, "Restarting unhealthy thread", slog.String("syslog_level", syslogLevelWarn.String()))
+
+	if !C.frankenphp_new_php_thread(C.uintptr_t(thread.threadIndex)) {
+		// probably unreachable
+		logger.LogAttrs(ctx, slog.LevelError, "Failed to restart an unhealthy thread", slog.String("syslog_level", syslogLevelErr.String()))
+	}
 }
 
 //export go_frankenphp_store_force_kill_slot
@@ -380,29 +413,12 @@ func go_frankenphp_store_force_kill_slot(threadIndex C.uintptr_t, slot C.force_k
 	thread.forceKillMu.Unlock()
 }
 
-//export go_frankenphp_clear_force_kill_slot
-func go_frankenphp_clear_force_kill_slot(threadIndex C.uintptr_t) {
-	// Called from C before ts_free_thread on both exit paths. Zeroing
+func (thread *phpThread) clearForceKillSlot() {
+	// Called before ts_free_thread on both exit paths. Zeroing
 	// the slot under the write lock guarantees any concurrent kill
 	// either completed before we got the lock or sees a zero slot.
-	thread := phpThreads[threadIndex]
 	thread.forceKillMu.Lock()
 	C.frankenphp_release_thread_for_kill(thread.forceKill)
 	thread.forceKill = C.force_kill_slot{}
 	thread.forceKillMu.Unlock()
-}
-
-//export go_frankenphp_on_thread_shutdown
-func go_frankenphp_on_thread_shutdown(threadIndex C.uintptr_t) {
-	thread := phpThreads[threadIndex]
-	thread.Unpin()
-
-	switch thread.state.Get() {
-	case state.Rebooting:
-		thread.state.Set(state.RebootReady)
-	case state.ForceRebooting:
-		thread.state.Set(state.YieldingForReboot)
-	default:
-		thread.state.Set(state.Done)
-	}
 }

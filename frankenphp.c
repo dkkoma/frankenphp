@@ -1861,6 +1861,12 @@ static void *php_thread(void *arg) {
   pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
 #endif
 
+  go_frankenphp_run_php_thread(thread_index);
+
+  return NULL;
+}
+
+void frankenphp_init_php_thread(void) {
   /* Initial allocation of all global PHP memory for this thread */
 #ifdef ZTS
   (void)ts_resource(0);
@@ -1873,33 +1879,24 @@ static void *php_thread(void *arg) {
   /* Publish this thread's force-kill slot to Go so the graceful-drain
    * grace period can wake it from a busy PHP loop or blocking syscall. */
   frankenphp_register_thread_for_kill(thread_index);
+}
 
-  bool thread_is_healthy = true;
+frankenphp_script_result frankenphp_execute_script(char *script_name) {
+  frankenphp_script_result result = {.thread_is_healthy = true};
   bool has_attempted_shutdown = false;
 
-  /* Main loop of the PHP thread, execute a PHP script and repeat until Go
-   * signals to stop */
   zend_first_try {
-    char *scriptName = NULL;
-    while ((scriptName = go_frankenphp_before_script_execution(thread_index))) {
-      has_attempted_shutdown = false;
+    frankenphp_update_request_context();
 
-      frankenphp_update_request_context();
-
-      if (UNEXPECTED(php_request_startup() == FAILURE)) {
-        /* only the request failed, the thread can serve the next one */
-        has_attempted_shutdown = true;
-        if (!SG(headers_sent)) {
-          SG(sapi_headers).http_response_code = 500;
-        }
-        reset_sandboxed_environment();
-        php_request_shutdown((void *)0);
-        sandboxed_env = NULL;
-        frankenphp_free_request_context();
-        go_frankenphp_after_script_execution(thread_index, EG(exit_status));
-        continue;
+    if (UNEXPECTED(php_request_startup() == FAILURE)) {
+      /* only the request failed, the thread can serve the next one */
+      has_attempted_shutdown = true;
+      if (!SG(headers_sent)) {
+        SG(sapi_headers).http_response_code = 500;
       }
-
+      reset_sandboxed_environment();
+      php_request_shutdown((void *)0);
+    } else {
 #if PHP_VERSION_ID < 80500
       /* Override opcache here again if loaded as a shared extension
        * (php 8.4 and under) */
@@ -1907,7 +1904,7 @@ static void *php_thread(void *arg) {
 #endif
 
       zend_file_handle file_handle;
-      zend_stream_init_filename(&file_handle, scriptName);
+      zend_stream_init_filename(&file_handle, script_name);
 
       file_handle.primary_script = 1;
       EG(exit_status) = 0;
@@ -1947,12 +1944,10 @@ static void *php_thread(void *arg) {
 
       /* shutdown the request, potential bailout to zend_catch */
       php_request_shutdown((void *)0);
-      /* a putenv() from a shutdown function or destructor created a new
-       * sandbox on the request heap, which php_request_shutdown() just freed */
-      sandboxed_env = NULL;
-      frankenphp_free_request_context();
-      go_frankenphp_after_script_execution(thread_index, EG(exit_status));
     }
+    /* a putenv() from a shutdown function or destructor created a new
+     * sandbox on the request heap, which php_request_shutdown() just freed */
+    sandboxed_env = NULL;
   }
   zend_catch {
 #ifndef PHP_WIN32
@@ -1963,7 +1958,7 @@ static void *php_thread(void *arg) {
 
     /* Critical failure from php_execute_script or php_request_shutdown, mark
      * the thread as unhealthy */
-    thread_is_healthy = false;
+    result.thread_is_healthy = false;
     if (!has_attempted_shutdown) {
       /* php_request_shutdown() was not called, force a shutdown now */
       reset_sandboxed_environment();
@@ -1980,16 +1975,16 @@ static void *php_thread(void *arg) {
       PG(last_error_message) = NULL;
       PG(last_error_file) = NULL;
     }
-    frankenphp_free_request_context();
-    go_frankenphp_after_script_execution(thread_index, EG(exit_status));
   }
   zend_end_try();
 
-  /* Must precede ts_free_thread: that frees the TSRM storage backing
-   * the slot's &EG() pointers. Clearing first means any concurrent
-   * force-kill either ran before us or sees a zero slot. */
-  go_frankenphp_clear_force_kill_slot(thread_index);
+  frankenphp_free_request_context();
+  result.exit_status = EG(exit_status);
 
+  return result;
+}
+
+void frankenphp_free_php_thread(void) {
   /* free all global PHP memory reserved for this thread */
 #ifdef ZTS
 #if PHP_VERSION_ID < 80700
@@ -1997,21 +1992,6 @@ static void *php_thread(void *arg) {
 #endif
   ts_free_thread();
 #endif
-
-  /* Thread is healthy, signal to Go that the thread has shut down */
-  if (thread_is_healthy) {
-    go_frankenphp_on_thread_shutdown(thread_index);
-    return NULL;
-  }
-
-  go_log(thread_index, "Restarting unhealthy thread", LOG_WARNING);
-
-  if (!frankenphp_new_php_thread(thread_index)) {
-    /* probably unreachable */
-    go_log(thread_index, "Failed to restart an unhealthy thread", LOG_ERR);
-  }
-
-  return NULL;
 }
 
 static void *php_main(void *arg) {
@@ -2032,9 +2012,15 @@ static void *php_main(void *arg) {
 
   set_thread_name("php-main");
 
+  go_frankenphp_run_main_thread((int)(intptr_t)arg);
+
+  return NULL;
+}
+
+void frankenphp_startup_php(int num_threads) {
 #ifdef ZTS
 #if (PHP_VERSION_ID >= 80300)
-  php_tsrm_startup_ex((intptr_t)arg);
+  php_tsrm_startup_ex(num_threads);
 #else
   php_tsrm_startup();
 #endif
@@ -2109,12 +2095,9 @@ static void *php_main(void *arg) {
   cfg_get_string("filter.default", &default_filter);
   should_filter_var = default_filter != NULL;
   original_user_abort_setting = PG(ignore_user_abort);
+}
 
-  go_frankenphp_main_thread_is_ready();
-
-  /* channel closed, shutdown gracefully. drainPHPThreads has already
-   * waited for every PHP thread to exit (state.Done), so SAPI/TSRM
-   * teardown here is safe. */
+void frankenphp_shutdown_php(void) {
   frankenphp_sapi_module.shutdown(&frankenphp_sapi_module);
 
   sapi_shutdown();
@@ -2126,10 +2109,6 @@ static void *php_main(void *arg) {
     free((char *)frankenphp_sapi_module.ini_entries);
     frankenphp_sapi_module.ini_entries = NULL;
   }
-
-  go_frankenphp_shutdown_main_thread();
-
-  return NULL;
 }
 
 int frankenphp_new_main_thread(int num_threads) {
